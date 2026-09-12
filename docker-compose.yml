@@ -1,0 +1,253 @@
+# PASSO 6.11 — IL SISTEMA COMPLETO DEL G6:
+# tre servizi, DUE database, e il finto fornitore esterno.
+#
+#   docker compose up --build     costruisce e avvia tutto
+#   docker compose down           ferma, i dati restano
+#   docker compose down -v        ferma E CANCELLA i dati
+#   docker compose logs -f booking-service
+#
+# ===========================================================================
+# PERCHE' QUESTO FILE STA IN UN REPOSITORY SUO
+#
+# Un repository per servizio significa che ognuno dei tre si clona, si
+# costruisce e si rilascia da solo. Un compose che facesse
+# "build: ../shows-service" dentro booking-service renderebbe quel
+# repository incostruibile per chi non ha anche gli altri due accanto — e
+# avrebbe rimesso esattamente l'accoppiamento che la separazione toglie.
+#
+# Il montaggio del sistema e' un artefatto CON UN CICLO DI VITA SUO: cambia
+# quando si aggiunge un servizio o si sposta una porta, non quando cambia una
+# riga di Java. In azienda questa cartella si chiama deploy, platform o infra;
+# con Kubernetes diventa il repository GitOps che Argo CD o Flux sorvegliano.
+# Il principio non cambia: il codice di un servizio e il montaggio del sistema
+# sono due cose diverse.
+#
+# I "build:" qui sotto puntano ai repository SORELLA. Il prerequisito e'
+# scritto nel README: i quattro repository clonati nella stessa cartella.
+# ===========================================================================
+#
+# Nota: "version:" in cima non si scrive piu' da Compose v2, e' obsoleto.
+
+services:
+
+  # =========================================================================
+  #  I DUE DATABASE
+  #
+  #  DUE, non due schemi dentro lo stesso PostgreSQL. E' la decisione
+  #  strutturale del G6: se fossero nello stesso database, prima o poi
+  #  qualcuno scriverebbe una JOIN fra bookings e shows, e da quel momento i
+  #  due servizi non potrebbero piu' cambiare tabella per conto loro.
+  #  Il costo si vede qui sotto: due container, due volumi, due healthcheck.
+  # =========================================================================
+
+  shows-db:
+    image: postgres:17-alpine
+    container_name: shows-db
+    environment:
+      POSTGRES_DB: ${SHOWS_DB_NAME:-shows_db}
+      POSTGRES_USER: ${SHOWS_DB_USER:-cinema}
+      POSTGRES_PASSWORD: ${SHOWS_DB_PASSWORD:-cinema}
+    ports:
+      # Esposto solo per poterci entrare con psql da fuori. In produzione
+      # questa riga si toglie: il database lo raggiunge solo chi sta sulla
+      # rete interna.
+      - "${SHOWS_DB_PORT:-5432}:5432"
+    volumes:
+      - shows_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # SENZA QUESTO il servizio parte prima che PostgreSQL accetti
+      # connessioni, Flyway fallisce e il container muore. depends_on da solo
+      # aspetta che il container sia AVVIATO, non che sia PRONTO.
+      test: ["CMD-SHELL", "pg_isready -U ${SHOWS_DB_USER:-cinema} -d ${SHOWS_DB_NAME:-shows_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  booking-db:
+    image: postgres:17-alpine
+    container_name: booking-db
+    environment:
+      POSTGRES_DB: ${BOOKING_DB_NAME:-booking_db}
+      POSTGRES_USER: ${BOOKING_DB_USER:-cinema}
+      POSTGRES_PASSWORD: ${BOOKING_DB_PASSWORD:-cinema}
+    ports:
+      # 5433 sull'HOST: la 5432 e' gia' di shows-db. DENTRO la rete di
+      # compose sono entrambi sulla 5432, perche' hanno indirizzi diversi —
+      # il nome del servizio. Due porte diverse servono solo a noi che
+      # guardiamo da fuori.
+      - "${BOOKING_DB_PORT:-5433}:5432"
+    volumes:
+      - booking_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${BOOKING_DB_USER:-cinema} -d ${BOOKING_DB_NAME:-booking_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # =========================================================================
+  #  IL FINTO FORNITORE ESTERNO  (passo 6.8b)
+  #
+  #  Un nginx che serve un file JSON statico, e nient'altro: e' l'interlocutore
+  #  del client Feign di shows-service. Una lezione su come si chiama un
+  #  servizio remoto ha bisogno di un servizio remoto, e dipendere da un'API
+  #  su internet in aula significa dipendere dal wifi dell'istituto.
+  # =========================================================================
+
+  catalog-provider:
+    image: nginx:alpine
+    container_name: catalog-provider
+    ports:
+      - "${CATALOG_PROVIDER_PORT:-8090}:80"
+    volumes:
+      # Il catalogo sta nel repository di shows-service, perche' e' lui a
+      # consumarlo. Montato in sola lettura: si modifica il file e la
+      # chiamata successiva vede i film nuovi, senza ricostruire niente.
+      - ../shows-service/fornitore:/usr/share/nginx/html:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost/catalog.json > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  # =========================================================================
+  #  I TRE SERVIZI
+  # =========================================================================
+
+  shows-service:
+    build: ../shows-service
+    image: cinema/shows-service:1.0
+    container_name: shows-service
+    ports:
+      - "${SHOWS_PORT:-8081}:8081"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      # NON localhost: dentro la rete di compose "localhost" e' il container
+      # stesso. L'indirizzo di un altro servizio e' IL SUO NOME.
+      # E' l'errore numero uno al primo docker compose up, e il messaggio
+      # (Connection refused) non aiuta a capirlo.
+      SHOWS_DB_URL: jdbc:postgresql://shows-db:5432/${SHOWS_DB_NAME:-shows_db}
+      SHOWS_DB_USER: ${SHOWS_DB_USER:-cinema}
+      SHOWS_DB_PASSWORD: ${SHOWS_DB_PASSWORD:-cinema}
+      # In HTTP senza porta vuol dire :80, che e' quella di nginx.
+      CINEMA_CATALOG_REMOTE_URL: http://catalog-provider
+      SQL_LOG_LEVEL: ${SQL_LOG_LEVEL:-INFO}
+      FEIGN_LOG_LEVEL: ${FEIGN_LOG_LEVEL:-INFO}
+    depends_on:
+      shows-db:
+        # non "avviato": SANO. E' l'healthcheck a deciderlo.
+        condition: service_healthy
+      catalog-provider:
+        condition: service_healthy
+    healthcheck:
+      # readiness, non liveness: qui la domanda e' "posso mandargli traffico?"
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8081/actuator/health/readiness | grep -q UP"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  pricing-service:
+    build: ../pricing-service
+    image: cinema/pricing-service:1.0
+    container_name: pricing-service
+    ports:
+      - "${PRICING_PORT:-8082}:8082"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      PRICING_LOG_LEVEL: ${PRICING_LOG_LEVEL:-WARN}
+    # NESSUN depends_on, e nessun database: questo servizio non dipende da
+    # niente. E' una funzione pura esposta via HTTP, e si scala moltiplicando
+    # le istanze:
+    #     docker compose up --scale pricing-service=3
+    # (per farlo davvero bisogna togliere container_name e la porta fissa:
+    #  due container non possono avere lo stesso nome ne' la stessa porta
+    #  sull'host. E' un buon esercizio da fare in aula.)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8082/actuator/health/readiness | grep -q UP"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      # Piu' corto degli altri: senza database da migrare, questo servizio e'
+      # pronto appena Spring e' su. E' l'altra faccia del non avere stato.
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+  booking-service:
+    build: ../booking-service
+    image: cinema/booking-service:1.0
+    container_name: booking-service
+    ports:
+      - "${BOOKING_PORT:-8083}:8083"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      BOOKING_DB_URL: jdbc:postgresql://booking-db:5432/${BOOKING_DB_NAME:-booking_db}
+      BOOKING_DB_USER: ${BOOKING_DB_USER:-cinema}
+      BOOKING_DB_PASSWORD: ${BOOKING_DB_PASSWORD:-cinema}
+      # PASSO 6.6 — gli indirizzi dei servizi a valle. Nome del servizio e
+      # porta INTERNA (8081, 8082), non quelle pubblicate sull'host: dentro
+      # la rete di compose le porte dell'host non esistono.
+      CINEMA_SHOWS_URL: http://shows-service:8081
+      CINEMA_PRICING_URL: http://pricing-service:8082
+      SQL_LOG_LEVEL: ${SQL_LOG_LEVEL:-INFO}
+      BOOKING_LOG_LEVEL: ${BOOKING_LOG_LEVEL:-INFO}
+    depends_on:
+      booking-db:
+        condition: service_healthy
+      # =====================================================================
+      # I DUE SERVIZI A VALLE: service_healthy serve solo a rendere
+      # PREVEDIBILE la dimostrazione in aula, non a proteggere il servizio.
+      #
+      # booking-service DEVE saper partire anche se shows e pricing non ci
+      # sono: a quel punto POST /bookings risponde 503 (passo 6.9) e
+      # GET /bookings continua a funzionare, perche' non chiama nessuno.
+      # Un servizio che si rifiuta di partire quando manca una dipendenza
+      # trasforma un guasto parziale in un guasto totale — ed e' esattamente
+      # l'errore che al G7 il circuit breaker serve a evitare.
+      #
+      # Da provare in aula:
+      #     docker compose stop pricing-service
+      #     curl -i -X POST localhost:8083/bookings -H 'Content-Type: application/json' \
+      #          -d '{"showId":1,"customerType":"STUDENT","quantity":1}'
+      #     -> 503 in circa 2 secondi (i timeout del passo 6.6), non un 500
+      #     curl -s localhost:8083/bookings   -> risponde comunque
+      # =====================================================================
+      shows-service:
+        condition: service_healthy
+      pricing-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8083/actuator/health/readiness | grep -q UP"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  shows_pgdata:
+  booking_pgdata:

@@ -1,0 +1,5 @@
+### I segreti non si committano: nel repository ci va .env.example
+.env
+
+### macOS
+.DS_Store
