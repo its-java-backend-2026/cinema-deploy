@@ -24,13 +24,14 @@ sistema sono due artefatti con cicli di vita diversi.*
 
 ---
 
-## Prerequisito: i sei repository accanto
+## Prerequisito: i sette repository accanto
 
 I `build:` del compose puntano ai repository sorella con un percorso relativo.
 Vanno clonati nella **stessa cartella**:
 
 ```
 una-cartella-qualsiasi/
+├── api-gateway/        (repo)   8080   <- l'unica porta di ingresso (dal G9)
 ├── shows-service/      (repo)   8081
 ├── pricing-service/    (repo)   8082
 ├── booking-service/    (repo)   8083   <- l'orchestratore della saga
@@ -59,16 +60,23 @@ Quando tutto è su:
 
 | Servizio | Porta | Swagger | Database |
 |---|---|---|---|
+| **api-gateway** | **8080** | — (instrada e basta) | — |
 | shows-service | 8081 | http://localhost:8081/swagger-ui.html | `shows_db` (5432) |
 | pricing-service | 8082 | http://localhost:8082/swagger-ui.html | — |
 | booking-service | 8083 | http://localhost:8083/swagger-ui.html | `booking_db` (5433) |
 | loyalty-service | 8084 | http://localhost:8084/swagger-ui.html | `loyalty_db` (5435) |
 | payment-service | 8085 | http://localhost:8085/swagger-ui.html | `payment_db` (5434) |
 | catalog-provider | 8090 | — (nginx con un JSON) | — |
+| **zipkin** | **9411** | <http://localhost:9411> | in memoria |
 
 Le porte fra parentesi sono quelle **sull'host**, per entrare con `psql` da
 fuori. Dentro la rete di compose i database stanno tutti sulla 5432: a
 distinguerli è il nome del servizio, non la porta.
+
+**Dal G9 l'unico indirizzo che conta è `http://localhost:8080/api/...`.** Le
+porte 8081-8085 restano pubblicate perché in aula serve poterle confrontare; in
+esercizio non lo sarebbero — resterebbero sulla rete interna, e il gateway
+sarebbe l'unica cosa esposta.
 
 ---
 
@@ -213,6 +221,80 @@ Fino al G7 lo stesso comando ne toglieva quattro. Il cambiamento non è in
 
 ---
 
+### 6. La consegna del G9: una prenotazione è UNA traccia su Zipkin
+
+```bash
+curl -s -X POST localhost:8080/api/bookings \
+     -H 'Content-Type: application/json' \
+     -H "Idempotency-Key: $(uuidgen)" \
+     -d '{"showId":1,"customerId":"mario.rossi","customerType":"STUDENT","quantity":2}'
+```
+
+Poi <http://localhost:9411> → *Run Query* → la traccia più recente. Sono **13
+span** che attraversano **sei** servizi:
+
+```
+api-gateway      SERVER  http post /api/bookings/**            1101 ms
+api-gateway      CLIENT  http post                             1096 ms
+booking-service  SERVER  http post /bookings                   1091 ms
+booking-service  CLIENT  http get                                27 ms
+shows-service    SERVER  http get /shows/{id}                    21 ms
+booking-service  CLIENT  http post                              911 ms
+pricing-service  SERVER  http post /prices/quote                902 ms
+booking-service  CLIENT  http post                               20 ms
+shows-service    SERVER  http post /shows/{id}/reserve           17 ms
+booking-service  CLIENT  http post                               52 ms
+payment-service  SERVER  http post /payments/authorize           48 ms
+booking-service  CLIENT  http post                               28 ms
+loyalty-service  SERVER  http post /loyalty/{customerid}/credit   25 ms
+```
+
+Gli span **CLIENT** e **SERVER** sono la stessa chiamata vista dalle due
+parti, e la differenza fra i due tempi è la rete più l'attesa: è il numero che
+distingue *«l'altro è lento»* da *«la rete fra noi è lenta»*.
+
+### 7. L'esercizio che vale la giornata (passo 9.9)
+
+Trovare il collo di bottiglia **guardando solo la traccia**, senza aprire un
+log.
+
+```bash
+CINEMA_PRICING_RITARDO_MS=800 docker compose up -d pricing-service
+```
+
+Poi si rifà la prenotazione qui sopra e si guarda Zipkin. Nella cascata degli
+span uno diventa lungo quanto tutti gli altri messi insieme, e ha il nome del
+servizio scritto sopra — l'output riportato al punto 6 è proprio con il ritardo
+acceso: `pricing-service` da solo si prende 902 ms su 1091.
+
+Per spegnerlo:
+
+```bash
+docker compose up -d pricing-service    # senza la variabile: torna a zero
+```
+
+Che il difetto sia **finto** non cambia niente del metodo: un servizio lento
+vero — una query senza indice, un pool esaurito, un GC che non respira — in una
+traccia si presenta esattamente così.
+
+### 8. Le metriche (passi 9.4 e 9.5)
+
+```bash
+curl -s localhost:8083/actuator/prometheus | grep http_server_requests_seconds_count
+curl -s localhost:8083/actuator/prometheus | grep hikaricp_connections_active
+curl -s localhost:8083/actuator/prometheus | grep resilience4j_circuitbreaker_state
+```
+
+Nessuno le ha scritte: arrivano dagli stessi filtri che gestiscono le
+richieste, ed è il motivo per cui non possono disallinearsi dal codice come
+farebbe una strumentazione scritta a mano.
+
+`hikaricp_connections_active` è quella da tenere d'occhio: è il numero che
+spiega i blocchi del passo 6.6, e dal G8 anche il motivo per cui le
+transazioni di `SagaStore` devono restare corte.
+
+---
+
 ## Comandi utili
 
 ```bash
@@ -228,6 +310,12 @@ docker exec -it shows-db   psql -U cinema -d shows_db
 docker exec -it booking-db psql -U cinema -d booking_db
 docker exec -it payment-db psql -U cinema -d payment_db
 docker exec -it loyalty-db psql -U cinema -d loyalty_db
+
+# le tracce (passo 9.7)
+open http://localhost:9411
+
+# le metriche di un servizio, in formato Prometheus (passo 9.5)
+curl -s localhost:8083/actuator/prometheus | head -40
 
 # lo stato delle saghe (passo 8.4)
 docker exec -it booking-db psql -U cinema -d booking_db \
