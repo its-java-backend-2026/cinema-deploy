@@ -1,5 +1,15 @@
-# PASSO 6.11 — IL SISTEMA COMPLETO DEL G6:
-# tre servizi, DUE database, e il finto fornitore esterno.
+# PASSO 8.1/8.2 — IL SISTEMA COMPLETO DEL G8:
+# CINQUE servizi, QUATTRO database, e il finto fornitore esterno.
+#
+# Rispetto al G6 si sono aggiunti i due partecipanti della saga:
+#   payment-service (8085) + payment_db   il passo che puo' dire di no
+#   loyalty-service (8084) + loyalty_db   il passo che compensa a meta'
+#
+# La prova del passo 8.8, con il sistema su:
+#   curl -i -X POST localhost:8083/bookings \
+#        -H 'Content-Type: application/json' -H 'Idempotency-Key: prova-1' \
+#        -d '{"showId":1,"customerId":"mario.rossi","customerType":"STUDENT","quantity":20}'
+#   -> 402, e i posti dello spettacolo 1 sono tornati disponibili.
 #
 #   docker compose up --build     costruisce e avvia tutto
 #   docker compose down           ferma, i dati restano
@@ -31,13 +41,21 @@
 services:
 
   # =========================================================================
-  #  I DUE DATABASE
+  #  I QUATTRO DATABASE
   #
-  #  DUE, non due schemi dentro lo stesso PostgreSQL. E' la decisione
+  #  QUATTRO, non quattro schemi dentro lo stesso PostgreSQL. E' la decisione
   #  strutturale del G6: se fossero nello stesso database, prima o poi
   #  qualcuno scriverebbe una JOIN fra bookings e shows, e da quel momento i
   #  due servizi non potrebbero piu' cambiare tabella per conto loro.
-  #  Il costo si vede qui sotto: due container, due volumi, due healthcheck.
+  #
+  #  Il costo si vede qui sotto, e dal G8 e' raddoppiato: quattro container,
+  #  quattro volumi, quattro healthcheck, quattro porte diverse sull'host.
+  #  Vale la pena guardarlo in faccia — e' il prezzo vero dei microservizi, e
+  #  si paga in memoria del portatile prima ancora che in complessita'.
+  #
+  #  E' anche il motivo per cui la saga esiste: senza un database solo non
+  #  c'e' nessuna transazione che tenga insieme i cinque servizi, e l'unico
+  #  modo di mantenere la coerenza e' compensare a mano cio' che si e' fatto.
   # =========================================================================
 
   shows-db:
@@ -94,6 +112,50 @@ services:
         limits:
           memory: 512M
 
+  payment-db:
+    image: postgres:17-alpine
+    container_name: payment-db
+    environment:
+      POSTGRES_DB: ${PAYMENT_DB_NAME:-payment_db}
+      POSTGRES_USER: ${PAYMENT_DB_USER:-cinema}
+      POSTGRES_PASSWORD: ${PAYMENT_DB_PASSWORD:-cinema}
+    ports:
+      - "${PAYMENT_DB_PORT:-5434}:5432"
+    volumes:
+      - payment_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PAYMENT_DB_USER:-cinema} -d ${PAYMENT_DB_NAME:-payment_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  loyalty-db:
+    image: postgres:17-alpine
+    container_name: loyalty-db
+    environment:
+      POSTGRES_DB: ${LOYALTY_DB_NAME:-loyalty_db}
+      POSTGRES_USER: ${LOYALTY_DB_USER:-cinema}
+      POSTGRES_PASSWORD: ${LOYALTY_DB_PASSWORD:-cinema}
+    ports:
+      - "${LOYALTY_DB_PORT:-5435}:5432"
+    volumes:
+      - loyalty_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LOYALTY_DB_USER:-cinema} -d ${LOYALTY_DB_NAME:-loyalty_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
   # =========================================================================
   #  IL FINTO FORNITORE ESTERNO  (passo 6.8b)
   #
@@ -125,7 +187,7 @@ services:
           memory: 64M
 
   # =========================================================================
-  #  I TRE SERVIZI
+  #  I CINQUE SERVIZI
   # =========================================================================
 
   shows-service:
@@ -194,6 +256,73 @@ services:
         limits:
           memory: 384M
 
+  payment-service:
+    build: ../payment-service
+    image: cinema/payment-service:1.0
+    container_name: payment-service
+    ports:
+      - "${PAYMENT_PORT:-8085}:8085"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      PAYMENT_DB_URL: jdbc:postgresql://payment-db:5432/${PAYMENT_DB_NAME:-payment_db}
+      PAYMENT_DB_USER: ${PAYMENT_DB_USER:-cinema}
+      PAYMENT_DB_PASSWORD: ${PAYMENT_DB_PASSWORD:-cinema}
+      # =====================================================================
+      # PASSO 8.8 — LA LEVA DELLA DIMOSTRAZIONE.
+      #
+      # Sopra questo importo il pagamento risponde 402 e la saga compensa.
+      # Con il default a 100.00 bastano 20 posti da 10.00 euro; per farlo
+      # fallire anche su una prenotazione piccola:
+      #
+      #     CINEMA_PAYMENT_SOGLIA=5 docker compose up -d payment-service
+      #
+      # E' configurazione e non codice proprio perche' in aula si cambia
+      # esperimento tre volte in mezz'ora.
+      # =====================================================================
+      CINEMA_PAYMENT_SOGLIA: ${CINEMA_PAYMENT_SOGLIA:-100.00}
+      SQL_LOG_LEVEL: ${SQL_LOG_LEVEL:-INFO}
+      PAYMENT_LOG_LEVEL: ${PAYMENT_LOG_LEVEL:-INFO}
+    depends_on:
+      payment-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8085/actuator/health/readiness | grep -q UP"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  loyalty-service:
+    build: ../loyalty-service
+    image: cinema/loyalty-service:1.0
+    container_name: loyalty-service
+    ports:
+      - "${LOYALTY_PORT:-8084}:8084"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      LOYALTY_DB_URL: jdbc:postgresql://loyalty-db:5432/${LOYALTY_DB_NAME:-loyalty_db}
+      LOYALTY_DB_USER: ${LOYALTY_DB_USER:-cinema}
+      LOYALTY_DB_PASSWORD: ${LOYALTY_DB_PASSWORD:-cinema}
+      SQL_LOG_LEVEL: ${SQL_LOG_LEVEL:-INFO}
+      LOYALTY_LOG_LEVEL: ${LOYALTY_LOG_LEVEL:-INFO}
+    depends_on:
+      loyalty-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8084/actuator/health/readiness | grep -q UP"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
   booking-service:
     build: ../booking-service
     image: cinema/booking-service:1.0
@@ -210,6 +339,9 @@ services:
       # la rete di compose le porte dell'host non esistono.
       CINEMA_SHOWS_URL: http://shows-service:8081
       CINEMA_PRICING_URL: http://pricing-service:8082
+      # PASSO 8.1 e 8.2 — i due partecipanti nuovi della saga.
+      CINEMA_PAYMENT_URL: http://payment-service:8085
+      CINEMA_LOYALTY_URL: http://loyalty-service:8084
       SQL_LOG_LEVEL: ${SQL_LOG_LEVEL:-INFO}
       BOOKING_LOG_LEVEL: ${BOOKING_LOG_LEVEL:-INFO}
     depends_on:
@@ -237,6 +369,14 @@ services:
         condition: service_healthy
       pricing-service:
         condition: service_healthy
+      # Dal G8 anche i due partecipanti nuovi. Vale per loro la stessa nota
+      # qui sopra: e' per rendere prevedibile la dimostrazione, non per
+      # proteggere booking-service — che deve saper partire da solo e
+      # rispondere 503 se manca qualcuno.
+      payment-service:
+        condition: service_healthy
+      loyalty-service:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O- http://localhost:8083/actuator/health/readiness | grep -q UP"]
       interval: 10s
@@ -251,3 +391,5 @@ services:
 volumes:
   shows_pgdata:
   booking_pgdata:
+  payment_pgdata:
+  loyalty_pgdata:

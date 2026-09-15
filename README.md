@@ -12,10 +12,10 @@ dominio.
 ## Perché esiste
 
 Ogni servizio ha il suo repository, e ognuno si clona, si costruisce e si
-rilascia **da solo**. Se il compose che avvia tutto stesse dentro uno dei tre,
-quel repository smetterebbe di essere autonomo: chi lo clona senza avere anche
-gli altri due accanto si troverebbe un file che non funziona, e sarebbe tornato
-l'accoppiamento che la separazione serviva a togliere.
+rilascia **da solo**. Se il compose che avvia tutto stesse dentro uno dei
+cinque, quel repository smetterebbe di essere autonomo: chi lo clona senza
+avere anche gli altri accanto si troverebbe un file che non funziona, e sarebbe
+tornato l'accoppiamento che la separazione serviva a togliere.
 
 In azienda questa cartella si chiama `deploy`, `platform` o `infra`. Con
 Kubernetes diventa il repository **GitOps** che Argo CD o Flux sorvegliano. Il
@@ -24,21 +24,23 @@ sistema sono due artefatti con cicli di vita diversi.*
 
 ---
 
-## Prerequisito: i quattro repository accanto
+## Prerequisito: i sei repository accanto
 
 I `build:` del compose puntano ai repository sorella con un percorso relativo.
 Vanno clonati nella **stessa cartella**:
 
 ```
 una-cartella-qualsiasi/
-├── shows-service/      (repo)
-├── pricing-service/    (repo)
-├── booking-service/    (repo)
-└── cinema-deploy/      (repo)  <- si lancia da qui
+├── shows-service/      (repo)   8081
+├── pricing-service/    (repo)   8082
+├── booking-service/    (repo)   8083   <- l'orchestratore della saga
+├── loyalty-service/    (repo)   8084   (dal G8)
+├── payment-service/    (repo)   8085   (dal G8)
+└── cinema-deploy/      (repo)          <- si lancia da qui
 ```
 
-Se manca uno dei tre, `docker compose up` si ferma subito dicendo quale
-percorso non trova: è un errore chiaro, e va bene così.
+Se ne manca uno, `docker compose up` si ferma subito dicendo quale percorso non
+trova: è un errore chiaro, e va bene così.
 
 ---
 
@@ -60,14 +62,20 @@ Quando tutto è su:
 | shows-service | 8081 | http://localhost:8081/swagger-ui.html | `shows_db` (5432) |
 | pricing-service | 8082 | http://localhost:8082/swagger-ui.html | — |
 | booking-service | 8083 | http://localhost:8083/swagger-ui.html | `booking_db` (5433) |
+| loyalty-service | 8084 | http://localhost:8084/swagger-ui.html | `loyalty_db` (5435) |
+| payment-service | 8085 | http://localhost:8085/swagger-ui.html | `payment_db` (5434) |
 | catalog-provider | 8090 | — (nginx con un JSON) | — |
+
+Le porte fra parentesi sono quelle **sull'host**, per entrare con `psql` da
+fuori. Dentro la rete di compose i database stanno tutti sulla 5432: a
+distinguerli è il nome del servizio, non la porta.
 
 ---
 
 ## La consegna del G6, in un comando
 
 > Una `POST /bookings` crea la prenotazione con il prezzo corretto e i posti
-> scalati, attraversando tre processi.
+> scalati, attraversando più processi. Dal G8 sono cinque.
 
 ```bash
 # i posti disponibili PRIMA
@@ -76,21 +84,23 @@ curl -s localhost:8081/shows/1 | grep -o '"availableSeats":[0-9]*'
 # la prenotazione: uno studente, due posti
 curl -s -X POST localhost:8083/bookings \
      -H 'Content-Type: application/json' \
-     -d '{"showId":1,"customerType":"STUDENT","quantity":2}'
+     -H 'Idempotency-Key: prova-1' \
+     -d '{"showId":1,"customerId":"mario.rossi","customerType":"STUDENT","quantity":2}'
 
 # i posti disponibili DOPO: due in meno
 curl -s localhost:8081/shows/1 | grep -o '"availableSeats":[0-9]*'
 ```
 
-Nella risposta c'è il `sagaId`. È la stringa che ricuce i log dei tre processi:
+Nella risposta c'è il `sagaId`. È la stringa che ricuce i log di **tutti** i
+processi coinvolti:
 
 ```bash
 docker compose logs | grep <il-sagaId-della-risposta>
 ```
 
 Si vedono, in ordine, la lettura dello spettacolo, il preventivo, la riserva
-dei posti e il salvataggio — in tre servizi diversi, con lo stesso
-identificativo.
+dei posti, l'autorizzazione del pagamento, l'accredito dei punti e la conferma
+— in cinque servizi diversi, con lo stesso identificativo.
 
 ---
 
@@ -138,16 +148,68 @@ curl -s -X POST localhost:8083/bookings \
 
 `unitPrice` viene ignorato: il prezzo lo dice `pricing-service`, sempre.
 
-### 4. Il buco che resta, ed è il G8
+### 4. La consegna del G8: un pagamento rifiutato non lascia posti bloccati
 
-Il passo 3 della saga (riserva) e il passo 4 (salvataggio) non sono nella
-stessa transazione, e non possono esserlo: una transazione locale non annulla
-un POST già arrivato a destinazione. Se il salvataggio fallisce, **i posti
-restano riservati**.
+> `payment-service` rifiuta sopra `CINEMA_PAYMENT_SOGLIA` (default `100.00`).
+> 20 posti da 10.00 euro fanno 200.00.
 
-Non è un difetto da nascondere: è il problema che il G8 risolve con le
-compensazioni. `ShowsClient.rilascia()` è già scritto, e oggi non lo chiama
-nessuno di proposito.
+```bash
+# PRIMA
+curl -s localhost:8081/shows/1 | grep -o '"availableSeats":[0-9]*'
+
+curl -i -X POST localhost:8083/bookings \
+     -H 'Content-Type: application/json' \
+     -H "Idempotency-Key: $(uuidgen)" \
+     -d '{"showId":1,"customerId":"mario.rossi","customerType":"STUDENT","quantity":20}'
+# -> HTTP/1.1 402 Payment Required
+#    "detail": "Pagamento rifiutato: Importo 200.00 oltre la soglia ..."
+#    "compensata": true
+
+# DOPO: gli stessi posti di prima
+curl -s localhost:8081/shows/1 | grep -o '"availableSeats":[0-9]*'
+```
+
+**I due numeri devono coincidere.** È tutta la giornata in due `curl`.
+
+E la saga racconta dove si è fermata:
+
+```bash
+docker exec -it booking-db psql -U cinema -d booking_db \
+  -c "SELECT booking_id, passo_raggiunto, stato, ultimo_errore
+        FROM saga_state ORDER BY id DESC LIMIT 5;"
+```
+
+`POSTI_RISERVATI` e non `PAGATO`: si è fermata **prima** del pagamento, quindi
+la compensazione ha rilasciato i posti e non ha stornato niente — non c'era
+niente da stornare.
+
+Per vederla fallire anche su una prenotazione piccola, si abbassa la soglia:
+
+```bash
+CINEMA_PAYMENT_SOGLIA=5 docker compose up -d payment-service
+```
+
+### 5. L'idempotenza dei partecipanti (passo 8.3)
+
+Ripetere un passo non lo esegue due volte, ed è ciò che permette ai retry di
+esistere:
+
+```bash
+curl -s localhost:8081/shows/1 | grep -o '"availableSeats":[0-9]*'
+
+# la stessa riserva, due volte, con lo stesso sagaId
+for i in 1 2; do
+  curl -s -o /dev/null -X POST localhost:8081/shows/1/reserve \
+       -H 'Content-Type: application/json' \
+       -d '{"sagaId":"prova-idempotenza","quantity":2}'
+done
+
+# due posti in meno, non quattro
+curl -s localhost:8081/shows/1 | grep -o '"availableSeats":[0-9]*'
+```
+
+Fino al G7 lo stesso comando ne toglieva quattro. Il cambiamento non è in
+`booking-service`: è `show_operations`, in `shows_db`.
 
 ---
 
@@ -164,21 +226,38 @@ docker compose stop pricing-service  # per le prove qui sopra
 # entrare nei database
 docker exec -it shows-db   psql -U cinema -d shows_db
 docker exec -it booking-db psql -U cinema -d booking_db
+docker exec -it payment-db psql -U cinema -d payment_db
+docker exec -it loyalty-db psql -U cinema -d loyalty_db
+
+# lo stato delle saghe (passo 8.4)
+docker exec -it booking-db psql -U cinema -d booking_db \
+  -c "SELECT booking_id, passo_raggiunto, stato FROM saga_state ORDER BY id DESC LIMIT 10;"
+
+# le saghe rimaste per strada, e quelle che nessuno sistemerà
+docker exec -it booking-db psql -U cinema -d booking_db \
+  -c "SELECT * FROM saga_state
+       WHERE stato = 'IN_CORSO' AND aggiornata_il < now() - interval '5 minutes'
+          OR stato = 'COMPENSAZIONE_PARZIALE';"
 ```
 
 ---
 
-## Due database, non due schemi
+## Quattro database, non quattro schemi
 
 È la decisione strutturale del G6 ed è quella che rende vero tutto il resto.
 
 Se `bookings` e `shows` stessero nello stesso PostgreSQL, prima o poi qualcuno
 scriverebbe una JOIN fra le due, e da quel momento nessuno dei due servizi
-potrebbe più cambiare la propria tabella senza rompere l'altro. Con due
-database la JOIN non è possibile: l'unico modo di leggere i dati altrui è
+potrebbe più cambiare la propria tabella senza rompere l'altro. Con database
+separati la JOIN non è possibile: l'unico modo di leggere i dati altrui è
 passare dalla sua API.
 
-Il prezzo si vede nel compose: due container, due volumi, due healthcheck. E
+Il prezzo si vede nel compose, e dal G8 è raddoppiato: quattro container,
+quattro volumi, quattro healthcheck, quattro porte diverse sull'host. Vale la
+pena guardarlo in faccia — è il prezzo vero dei microservizi, e si paga in
+memoria del portatile prima ancora che in complessità. È anche il motivo per
+cui la saga esiste: senza un database solo non c'è nessuna transazione che
+tenga insieme i cinque servizi. E
 nella `V1` di `booking-service` non c'è nessuna `FOREIGN KEY` verso `shows`.
 L'integrità referenziale fra servizi non esiste — al suo posto ci sono la saga
 e la consapevolezza che i dati sono coerenti *alla fine*, non *sempre*.
